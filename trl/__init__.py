@@ -52,6 +52,8 @@ _import_structure = {
         "setup_chat_format",
     ],
     "trainer": [
+        "ADPOConfig",
+        "ADPOTrainer",
         "AllTrueJudge",
         "BaseBinaryJudge",
         "BaseJudge",
@@ -133,6 +135,8 @@ if TYPE_CHECKING:
     )
     from .scripts import DatasetMixtureConfig, ScriptArguments, TrlParser, get_dataset, init_zero_verbose
     from .trainer import (
+        ADPOConfig,
+        ADPOTrainer,
         AllTrueJudge,
         BaseBinaryJudge,
         BaseJudge,

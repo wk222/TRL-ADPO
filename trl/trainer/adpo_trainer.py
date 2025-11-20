@@ -544,6 +544,24 @@ class ADPOTrainer(BaseTrainer):
                 max_completion_length=self.max_completion_length,
             )
 
+        # Warn if per_device_train_batch_size is not compatible with num_generations for ADPO
+        if args.per_device_train_batch_size % self.num_generations != 0:
+            recommended_batch_size = self.num_generations * max(1, args.per_device_train_batch_size // self.num_generations)
+            logger.warning(
+                f"⚠️  ADPO Performance Warning: per_device_train_batch_size ({args.per_device_train_batch_size}) is not "
+                f"divisible by num_generations ({self.num_generations}). ADPO's listwise loss will auto-truncate batches, "
+                f"which may waste {args.per_device_train_batch_size % self.num_generations} samples per batch. "
+                f"For optimal efficiency, set per_device_train_batch_size={recommended_batch_size} or enable dataloader_drop_last=True."
+            )
+        
+        if args.per_device_eval_batch_size % self.num_generations != 0:
+            recommended_eval_batch_size = self.num_generations * max(1, args.per_device_eval_batch_size // self.num_generations)
+            logger.warning(
+                f"⚠️  ADPO Performance Warning: per_device_eval_batch_size ({args.per_device_eval_batch_size}) is not "
+                f"divisible by num_generations ({self.num_generations}). Evaluation batches will be auto-truncated. "
+                f"For optimal efficiency, set per_device_eval_batch_size={recommended_eval_batch_size}."
+            )
+
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
@@ -1816,6 +1834,7 @@ class ADPOTrainer(BaseTrainer):
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
             "advantages": advantages,
+            "rewards": rewards,
             "num_items_in_batch": num_items_in_batch,
         }
         if old_per_token_logps is not None:
@@ -1902,6 +1921,36 @@ class ADPOTrainer(BaseTrainer):
         L = -E[q_target * log(p_anchored)]
         where p_anchored(i|S) = softmax((s_i - s_anchor_i) / tau)
         """
+        # Auto-truncate batch if not divisible by num_generations
+        batch_size = inputs["advantages"].size(0)
+        if batch_size % self.num_generations != 0:
+            # Calculate the largest valid batch size
+            valid_batch_size = (batch_size // self.num_generations) * self.num_generations
+            
+            if valid_batch_size == 0:
+                # Batch too small, skip entirely
+                logger.warning(
+                    f"Skipping batch: size {batch_size} < num_generations {self.num_generations}. "
+                    f"Returning zero loss. Consider setting dataloader_drop_last=True in config."
+                )
+                return torch.tensor(0.0, device=inputs["advantages"].device, requires_grad=True)
+            
+            # Truncate all inputs to valid_batch_size
+            logger.warning(
+                f"Auto-truncating batch from {batch_size} to {valid_batch_size} samples "
+                f"(must be divisible by num_generations={self.num_generations}). "
+                f"Discarding {batch_size - valid_batch_size} samples. "
+                f"To avoid this, ensure per_device_*_batch_size is a multiple of num_generations, "
+                f"or set dataloader_drop_last=True."
+            )
+            
+            # Truncate all tensor inputs
+            for key in inputs.keys():
+                if isinstance(inputs[key], torch.Tensor):
+                    inputs[key] = inputs[key][:valid_batch_size]
+            
+            batch_size = valid_batch_size
+        
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -1987,16 +2036,34 @@ class ADPOTrainer(BaseTrainer):
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
 
         # Adaptive Temperature Scaling (Section 3.7)
-        if self.args.use_adaptive_tau:
-            # Reconstruct Q to compute entropy
-            adv_view = inputs["advantages"].view(-1, self.num_generations)
-            if self.args.use_q_centering:
-                adv_view = adv_view - adv_view.mean(dim=1, keepdim=True)
-            q_current = torch.nn.functional.softmax(adv_view, dim=-1)
+        # Check if batch size is compatible with num_generations
+        batch_size = inputs["advantages"].size(0)
+        
+        # Prepare q_target with explicit normalization as requested
+        # Get advantages and reshape
+        advantages = inputs["advantages"]  # [B_total]
+        B_prompts = batch_size // self.num_generations
+        
+        if batch_size % self.num_generations == 0:
+            advantages = advantages.view(B_prompts, self.num_generations)
             
+            # Explicit Group-wise Normalization: R_norm = (R - mean) / (std + eps)
+            # This ensures q reflects relative quality regardless of reward scale
+            mean_adv = advantages.mean(dim=1, keepdim=True)
+            std_adv = advantages.std(dim=1, keepdim=True)
+            advantages_norm = (advantages - mean_adv) / (std_adv + 1e-8)
+            
+            # Calculate q = softmax(R_norm / beta_reward)
+            q_logits = advantages_norm / self.args.beta_reward
+            q_target = torch.nn.functional.softmax(q_logits, dim=-1)
+        else:
+            # Fallback for incompatible batch sizes (should be rare if config is correct)
+            q_target = None 
+
+        if self.args.use_adaptive_tau and batch_size % self.num_generations == 0:
             # H(q)
-            entropy = -(q_current * torch.log(q_current + 1e-8)).sum(dim=-1)
-            max_entropy = torch.log(torch.tensor(self.num_generations, dtype=q_current.dtype, device=q_current.device))
+            entropy = -(q_target * torch.log(q_target + 1e-8)).sum(dim=-1)
+            max_entropy = torch.log(torch.tensor(self.num_generations, dtype=q_target.dtype, device=q_target.device))
             
             # tau(x) = max(tau_min, tau_base * (1 - alpha * H/H_max))
             adaptive_factor = 1.0 - self.args.adaptive_tau_alpha * (entropy / max_entropy)
@@ -2011,6 +2078,16 @@ class ADPOTrainer(BaseTrainer):
                  mode = "train" if self.model.training else "eval"
                  self._metrics[mode]["adpo/mean_tau"] = [current_tau.mean().item()]
         else:
+            # Use fixed tau if batch size doesn't match or adaptive_tau is disabled
+            if self.args.use_adaptive_tau and batch_size % self.num_generations != 0:
+                # Only warn once
+                if not hasattr(self, '_adaptive_tau_warning_shown'):
+                    logger.warning(
+                        f"Adaptive tau is enabled but batch size ({batch_size}) is not divisible by "
+                        f"num_generations ({self.num_generations}). Using fixed tau={self.args.tau}. "
+                        "To use adaptive tau, ensure per_device_train_batch_size is divisible by num_generations."
+                    )
+                    self._adaptive_tau_warning_shown = True
             current_tau = self.args.tau
 
         # Compute anchored scores: (s - s_anchor) / tau
@@ -2021,20 +2098,38 @@ class ADPOTrainer(BaseTrainer):
         B_prompts = B_total // self.num_generations
         anchored_scores = anchored_scores.view(B_prompts, self.num_generations)
 
-        # Get advantages and reshape
-        advantages = inputs["advantages"]  # [B_total]
-        advantages = advantages.view(B_prompts, self.num_generations)
-
-        # Optional: Q-centering
-        if self.args.use_q_centering:
-            advantages = advantages - advantages.mean(dim=1, keepdim=True)
-
-        # Compute target distribution from advantages
-        q_target = torch.nn.functional.softmax(advantages, dim=-1)  # [B_prompts, K]
+        # If q_target wasn't computed above (due to batch size mismatch), compute it now using standard method
+        if q_target is None:
+             advantages = inputs["advantages"].view(B_prompts, self.num_generations)
+             if self.args.use_q_centering:
+                advantages = advantages - advantages.mean(dim=1, keepdim=True)
+             q_target = torch.nn.functional.softmax(advantages, dim=-1)
 
         # ADPO listwise loss: cross-entropy
         log_p_anchored = torch.nn.functional.log_softmax(anchored_scores, dim=-1)
-        loss = -(q_target * log_p_anchored).sum(dim=-1).mean()
+        per_prompt_loss = -(q_target * log_p_anchored).sum(dim=-1)
+        
+        # Drop failed prompts if requested
+        valid_mask = None
+        if self.args.drop_all_failed_prompts:
+            rewards = inputs["rewards"].view(B_prompts, self.num_generations)
+            # Check if all generations in the group have reward <= 0 (covers 0 and negative rewards)
+            is_failed = (rewards <= 0.0).all(dim=1)
+            if is_failed.any():
+                valid_mask = ~is_failed
+                if valid_mask.sum() == 0:
+                    loss = torch.tensor(0.0, device=per_prompt_loss.device, requires_grad=True)
+                else:
+                    loss = per_prompt_loss[valid_mask].mean()
+                
+                # Log dropped count
+                if self.state.global_step % 10 == 0:
+                    mode = "train" if self.model.training else "eval"
+                    self._metrics[mode]["adpo/dropped_prompts"] = [is_failed.sum().item()]
+            else:
+                loss = per_prompt_loss.mean()
+        else:
+            loss = per_prompt_loss.mean()
 
         # Optional: Add KL penalty (like GRPO's beta)
         if self.args.beta_anchor_kl > 0:
@@ -2042,7 +2137,15 @@ class ADPOTrainer(BaseTrainer):
                 torch.exp(anchor_per_token_logps - per_token_logps) -
                 (anchor_per_token_logps - per_token_logps) - 1
             )
-            mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+            
+            # Mask KL for dropped prompts
+            current_completion_mask = completion_mask
+            if valid_mask is not None:
+                # Expand valid_mask [B_prompts] -> [B_total]
+                valid_mask_expanded = valid_mask.repeat_interleave(self.num_generations)
+                current_completion_mask = completion_mask * valid_mask_expanded.unsqueeze(1)
+                
+            mean_kl = (per_token_kl * current_completion_mask).sum() / current_completion_mask.sum().clamp(min=1.0)
             loss = loss + self.args.beta_anchor_kl * mean_kl
 
         # Normalize by gradient accumulation steps
@@ -2123,22 +2226,25 @@ class ADPOTrainer(BaseTrainer):
             images_raw = self._logs["images"] or []
 
             for logging_backend in logging_backends:
-                if images_raw:
-                    images = []
-                    for image_list in self._logs["images"]:
-                        images.append([logging_backend.Image(image) for image in image_list])
-                    df = pd.concat(
-                        [df_base, pd.Series(images, name="image")],
-                        axis=1,
-                        copy=False,
-                    )
-                else:
-                    df = df_base
+                try:
+                    if images_raw:
+                        images = []
+                        for image_list in self._logs["images"]:
+                            images.append([logging_backend.Image(image) for image in image_list])
+                        df = pd.concat(
+                            [df_base, pd.Series(images, name="image")],
+                            axis=1,
+                            copy=False,
+                        )
+                    else:
+                        df = df_base
 
-                if self.log_unique_prompts:
-                    df = df.drop_duplicates(subset=["prompt"])
+                    if self.log_unique_prompts:
+                        df = df.drop_duplicates(subset=["prompt"])
 
-                logging_backend.log({"completions": logging_backend.Table(dataframe=df)})
+                    logging_backend.log({"completions": logging_backend.Table(dataframe=df)})
+                except Exception as e:
+                    logger.warning(f"Failed to log completions table to {logging_backend.__name__}: {e}. Continuing training...")
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):

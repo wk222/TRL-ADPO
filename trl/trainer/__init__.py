@@ -18,6 +18,8 @@ from ..import_utils import _LazyModule
 
 
 _import_structure = {
+    "adpo_config": ["ADPOConfig"],
+    "adpo_trainer": ["ADPOTrainer"],
     "bco_config": ["BCOConfig"],
     "bco_trainer": ["BCOTrainer"],
     "callbacks": [
@@ -78,6 +80,8 @@ _import_structure = {
 }
 
 if TYPE_CHECKING:
+    from .adpo_config import ADPOConfig
+    from .adpo_trainer import ADPOTrainer
     from .bco_config import BCOConfig
     from .bco_trainer import BCOTrainer
     from .callbacks import (

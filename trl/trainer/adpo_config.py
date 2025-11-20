@@ -107,7 +107,7 @@ class ADPOConfig(GRPOConfig):
     """
 
     tau: float = field(
-        default=1.0,
+        default=0.8,
         metadata={"help": "Temperature for the anchored softmax distribution."},
     )
     anchor_update_mode: Literal["fixed", "ema", "kl_triggered", "on_policy"] = field(
@@ -135,7 +135,7 @@ class ADPOConfig(GRPOConfig):
         metadata={"help": "Additional KL penalty coefficient (on top of anchoring). 0 = pure ADPO."},
     )
     use_adaptive_tau: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Whether to use entropy-based adaptive temperature scaling (Section 3.7 of paper)."},
     )
     adaptive_tau_alpha: float = field(
@@ -143,7 +143,15 @@ class ADPOConfig(GRPOConfig):
         metadata={"help": "Modulation strength for adaptive tau. Formula: tau * (1 - alpha * H/H_max)"},
     )
     adaptive_tau_min: float = field(
-        default=0.1,
+        default=0.05,
         metadata={"help": "Minimum value for tau when using adaptive scaling (to prevent division by zero)."},
+    )
+    beta_reward: float = field(
+        default=0.5,
+        metadata={"help": "Temperature for reward softmax (q computation). q = softmax(R_norm / beta_reward)."},
+    )
+    drop_all_failed_prompts: bool = field(
+        default=False,
+        metadata={"help": "Whether to drop prompts where all generations have 0 reward."},
     )
 
