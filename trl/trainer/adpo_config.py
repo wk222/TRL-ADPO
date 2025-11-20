@@ -28,6 +28,13 @@ class ADPOConfig(GRPOConfig):
     ADPO uses an anchored distribution p_θ(i|S) = softmax((s_i - s_anchor_i) / τ)
     instead of PPO-style clipping. The anchor policy can be fixed or dynamically updated.
     
+    **Important Notes**:
+    - `use_liger_kernel` is not supported. ADPO uses a different loss than GRPO (anchored listwise 
+      vs PPO clipping), so LigerFusedLinearGRPOLoss cannot be used.
+    - `beta` (from GRPOConfig) and `beta_anchor_kl` serve different purposes:
+      * `beta`: KL penalty w.r.t. ref_model (only when ref_model is provided)
+      * `beta_anchor_kl`: KL penalty w.r.t. anchor policy (ADPO-specific)
+    
     Args:
         tau (`float`, *optional*, defaults to `1.0`):
             Temperature parameter for the anchored softmax distribution.
@@ -48,7 +55,10 @@ class ADPOConfig(GRPOConfig):
             Whether to center advantages by group mean before computing target distribution.
             This helps numerical stability and is recommended for most use cases.
         beta_anchor_kl (`float`, *optional*, defaults to `0.0`):
-            Additional KL penalty coefficient for KL(π || π_anchor).
+            **ADPO-specific** KL penalty coefficient for KL(π_current || π_anchor).
+            This is different from `beta` (inherited from GRPOConfig):
+            - `beta`: Used only when `ref_model` is provided (for KL(π || π_ref) in GRPO/ref mode)
+            - `beta_anchor_kl`: Used for KL(π || π_anchor) in ADPO's anchored loss
             Set to 0 for pure ADPO (using only the anchoring mechanism).
             Non-zero values add an explicit KL penalty on top of anchoring.
     

@@ -520,6 +520,13 @@ class ADPOTrainer(BaseTrainer):
 
         # Liger loss
         if self.use_liger_kernel:
+            raise NotImplementedError(
+                "ADPO does not yet support Liger Kernel. The LigerFusedLinearGRPOLoss implements "
+                "GRPO's PPO-style loss, not ADPO's anchored listwise loss. Please set `use_liger_kernel=False` "
+                "in ADPOConfig. If you need Liger Kernel support for ADPO, a custom LigerFusedLinearADPOLoss "
+                "needs to be implemented."
+            )
+            # Note: The code below is kept for reference but will not be reached
             if not is_liger_kernel_available():
                 raise ImportError(
                     "Liger is required to use `use_liger_kernel` as the GRPO loss. Run `pip install liger-kernel`."
@@ -742,9 +749,12 @@ class ADPOTrainer(BaseTrainer):
             # EMA update: anchor = alpha * anchor + (1-alpha) * current
             alpha = self.args.ema_alpha
             with torch.no_grad():
+                # Unwrap model to handle FSDP/DeepSpeed sharded states (especially ZeRO3)
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                unwrapped_anchor = self.accelerator.unwrap_model(self.anchor_policy)
                 for anchor_param, current_param in zip(
-                    self.anchor_policy.parameters(),
-                    self.model.parameters()
+                    unwrapped_anchor.parameters(),
+                    unwrapped_model.parameters()
                 ):
                     anchor_param.data.mul_(alpha).add_((1 - alpha) * current_param.data)
             self.anchor_update_count += 1
@@ -754,11 +764,13 @@ class ADPOTrainer(BaseTrainer):
             if len(self.kl_window) >= self.kl_window_size:
                 mean_kl = torch.tensor(self.kl_window).mean().item()
                 if mean_kl > self.args.kl_threshold:
-                    # Hard copy
+                    # Hard copy - unwrap models to handle FSDP/DeepSpeed sharded states
                     with torch.no_grad():
+                        unwrapped_model = self.accelerator.unwrap_model(self.model)
+                        unwrapped_anchor = self.accelerator.unwrap_model(self.anchor_policy)
                         for anchor_param, current_param in zip(
-                            self.anchor_policy.parameters(),
-                            self.model.parameters()
+                            unwrapped_anchor.parameters(),
+                            unwrapped_model.parameters()
                         ):
                             anchor_param.data.copy_(current_param.data)
                     self.anchor_update_count += 1
@@ -1873,9 +1885,12 @@ class ADPOTrainer(BaseTrainer):
         if return_outputs:
             raise ValueError("The ADPOTrainer does not support returning outputs")
         if self.use_liger_kernel:
-            # Compute the loss using the liger grpo loss
-            unwrapped_model = self.accelerator.unwrap_model(model)
-            return self._forward_redirection(model, unwrapped_model, self.compute_liger_loss, unwrapped_model, inputs)
+            raise NotImplementedError(
+                "ADPO does not yet support Liger Kernel. The current LigerFusedLinearGRPOLoss implements "
+                "GRPO's PPO-style loss, not ADPO's anchored listwise loss. Please set `use_liger_kernel=False` "
+                "in ADPOConfig. If you need Liger Kernel support for ADPO, please implement "
+                "LigerFusedLinearADPOLoss or similar."
+            )
         else:
             return self._compute_loss(model, inputs)
 
