@@ -134,4 +134,16 @@ class ADPOConfig(GRPOConfig):
         default=0.0,
         metadata={"help": "Additional KL penalty coefficient (on top of anchoring). 0 = pure ADPO."},
     )
+    use_adaptive_tau: bool = field(
+        default=False,
+        metadata={"help": "Whether to use entropy-based adaptive temperature scaling (Section 3.7 of paper)."},
+    )
+    adaptive_tau_alpha: float = field(
+        default=0.5,
+        metadata={"help": "Modulation strength for adaptive tau. Formula: tau * (1 - alpha * H/H_max)"},
+    )
+    adaptive_tau_min: float = field(
+        default=0.1,
+        metadata={"help": "Minimum value for tau when using adaptive scaling (to prevent division by zero)."},
+    )
 

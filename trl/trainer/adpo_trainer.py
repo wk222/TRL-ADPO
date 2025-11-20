@@ -1986,8 +1986,35 @@ class ADPOTrainer(BaseTrainer):
                 )
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
 
+        # Adaptive Temperature Scaling (Section 3.7)
+        if self.args.use_adaptive_tau:
+            # Reconstruct Q to compute entropy
+            adv_view = inputs["advantages"].view(-1, self.num_generations)
+            if self.args.use_q_centering:
+                adv_view = adv_view - adv_view.mean(dim=1, keepdim=True)
+            q_current = torch.nn.functional.softmax(adv_view, dim=-1)
+            
+            # H(q)
+            entropy = -(q_current * torch.log(q_current + 1e-8)).sum(dim=-1)
+            max_entropy = torch.log(torch.tensor(self.num_generations, dtype=q_current.dtype, device=q_current.device))
+            
+            # tau(x) = max(tau_min, tau_base * (1 - alpha * H/H_max))
+            adaptive_factor = 1.0 - self.args.adaptive_tau_alpha * (entropy / max_entropy)
+            current_tau = self.args.tau * adaptive_factor
+            current_tau = torch.clamp(current_tau, min=self.args.adaptive_tau_min)
+            
+            # Broadcast: [B_prompts] -> [B_prompts, K] -> [B_total]
+            current_tau = current_tau.unsqueeze(-1).repeat(1, self.num_generations).view(-1)
+            
+            # Log mean tau for diagnostics
+            if self.state.global_step % 10 == 0:
+                 mode = "train" if self.model.training else "eval"
+                 self._metrics[mode]["adpo/mean_tau"] = [current_tau.mean().item()]
+        else:
+            current_tau = self.args.tau
+
         # Compute anchored scores: (s - s_anchor) / tau
-        anchored_scores = (sequence_logps - anchor_sequence_logps) / self.args.tau
+        anchored_scores = (sequence_logps - anchor_sequence_logps) / current_tau
 
         # Reshape to [B_prompts, num_generations]
         B_total = anchored_scores.size(0)
