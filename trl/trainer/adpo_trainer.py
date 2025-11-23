@@ -2165,8 +2165,12 @@ class ADPOTrainer(BaseTrainer):
         mode = "train" if self.model.training else "eval"
         self._metrics[mode]["adpo/anchor_kl"].append(kl_val)
         self._metrics[mode]["adpo/anchor_updates"] = [self.anchor_update_count]
+        
+        # Compute masked mean entropy (only over valid completion tokens, excluding padding)
+        completion_token_count = completion_mask.sum().clamp(min=1.0)
+        mean_entropy = (entropies * completion_mask).sum() / completion_token_count
         self._metrics[mode]["entropy"].append(
-            self.accelerator.gather(entropies.mean()).nanmean().item()
+            self.accelerator.gather(mean_entropy).nanmean().item()
         )
 
         if self.args.beta_anchor_kl > 0:
