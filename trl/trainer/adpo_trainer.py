@@ -2065,8 +2065,12 @@ class ADPOTrainer(BaseTrainer):
             entropy = -(q_target * torch.log(q_target + 1e-8)).sum(dim=-1)
             max_entropy = torch.log(torch.tensor(self.num_generations, dtype=q_target.dtype, device=q_target.device))
             
-            # tau(x) = max(tau_min, tau_base * (1 - alpha * H/H_max))
-            adaptive_factor = 1.0 - self.args.adaptive_tau_alpha * (entropy / max_entropy)
+            # tau(x) = max(tau_min, tau_base * (1 - alpha * (1 - H/H_max)))
+            # Logic: 
+            # - High Entropy (uncertain rewards) -> H/H_max ~ 1 -> factor ~ 1 -> tau keeps high (base)
+            # - Low Entropy (certain rewards)    -> H/H_max ~ 0 -> factor ~ 1-alpha -> tau drops
+            normalized_entropy = entropy / max_entropy
+            adaptive_factor = 1.0 - self.args.adaptive_tau_alpha * (1.0 - normalized_entropy)
             current_tau = self.args.tau * adaptive_factor
             current_tau = torch.clamp(current_tau, min=self.args.adaptive_tau_min)
             
