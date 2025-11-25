@@ -2049,9 +2049,9 @@ class ADPOTrainer(BaseTrainer):
             
             # Explicit Group-wise Normalization: R_norm = (R - mean) / (std + eps)
             # This ensures q reflects relative quality regardless of reward scale
-            mean_adv = advantages.mean(dim=1, keepdim=True)
-            std_adv = advantages.std(dim=1, keepdim=True)
-            advantages_norm = (advantages - mean_adv) / (std_adv + 1e-8)
+            # FIXED: Removed division by std to avoid softmax saturation (gradient vanishing) when std is small.
+            # Using simple centering (U-PXU projection idea applied to advantages)
+            advantages_norm = advantages - advantages.mean(dim=1, keepdim=True)
             
             # Calculate q = softmax(R_norm / beta_reward)
             q_logits = advantages_norm / self.args.beta_reward
@@ -2107,7 +2107,14 @@ class ADPOTrainer(BaseTrainer):
              advantages = inputs["advantages"].view(B_prompts, self.num_generations)
              if self.args.use_q_centering:
                 advantages = advantages - advantages.mean(dim=1, keepdim=True)
-             q_target = torch.nn.functional.softmax(advantages, dim=-1)
+             q_target = torch.nn.functional.softmax(advantages / self.args.beta_reward, dim=-1)
+
+        # Implement ADPO Eq (2): q-centering of anchored logits
+        # bar{u}_i = u_i - sum_j q(j) u_j
+        # This projects logits onto the tangent space 1_perp (U-PXU projection)
+        if self.args.use_q_centering:
+            expected_u = (q_target * anchored_scores).sum(dim=1, keepdim=True)
+            anchored_scores = anchored_scores - expected_u
 
         # ADPO listwise loss: cross-entropy
         log_p_anchored = torch.nn.functional.log_softmax(anchored_scores, dim=-1)
