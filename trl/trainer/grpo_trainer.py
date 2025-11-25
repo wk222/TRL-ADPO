@@ -1663,6 +1663,7 @@ class GRPOTrainer(BaseTrainer):
         )
         all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
         advantages = advantages[process_slice]
+        rewards_sliced = rewards[process_slice]  # keep rewards for drop_all_failed_prompts
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         for i, reward_func_name in enumerate(self.reward_func_names):
@@ -1722,6 +1723,7 @@ class GRPOTrainer(BaseTrainer):
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
             "advantages": advantages,
+            "rewards": rewards_sliced,
             "num_items_in_batch": num_items_in_batch,
         }
         if old_per_token_logps is not None:
@@ -1885,6 +1887,26 @@ class GRPOTrainer(BaseTrainer):
 
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
+
+        # Drop failed prompts if requested (prompts where all generations have reward <= 0)
+        valid_mask = None
+        if self.args.drop_all_failed_prompts:
+            rewards = inputs["rewards"]
+            B_total = rewards.size(0)
+            B_prompts = B_total // self.num_generations
+            rewards_grouped = rewards.view(B_prompts, self.num_generations)
+            # Check if all generations in the group have reward <= 0
+            is_failed = (rewards_grouped <= 0.0).all(dim=1)
+            if is_failed.any():
+                valid_mask = ~is_failed
+                # Expand valid_mask [B_prompts] -> [B_total]
+                valid_mask_expanded = valid_mask.repeat_interleave(self.num_generations)
+                # Apply mask to completion_mask
+                completion_mask = completion_mask * valid_mask_expanded.unsqueeze(1)
+                # Log dropped count
+                if self.state.global_step % 10 == 0:
+                    mode = "train" if self.model.training else "eval"
+                    self._metrics[mode]["grpo/dropped_prompts"] = [is_failed.sum().item()]
 
         if self.loss_type == "grpo":
             loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()

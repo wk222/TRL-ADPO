@@ -699,6 +699,15 @@ class GRPOConfig(TrainingArguments):
         },
     )
 
+    # Parameters that control sample filtering
+    drop_all_failed_prompts: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to drop prompts where all generations have reward <= 0. This filters out prompts "
+            "where no generation received a positive reward."
+        },
+    )
+
     # Deprecated arguments
     wandb_log_unique_prompts: bool | None = field(
         default=None,
