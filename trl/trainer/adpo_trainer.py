@@ -1974,16 +1974,21 @@ class ADPOTrainer(BaseTrainer):
             token_type_ids=inputs.get("token_type_ids"),
         )
 
-        # Sum to get sequence-level log probs
-        sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)  # [B]
-
         # Compute anchor policy scores based on mode
+        # Optimization: compute (logps - anchor_logps) at token level first, then sum
+        # This avoids keeping two separate sequence_logps tensors in memory
         if self.args.anchor_update_mode == "on_policy":
             # On-policy mode: use old_per_token_logps (like GRPO)
             # This makes anchor = policy at generation time, updated every generation
             old_per_token_logps = inputs.get("old_per_token_logps")
             anchor_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
-            anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
+            # Compute diff at token level, then sum - more memory efficient
+            per_token_diff = per_token_logps - anchor_per_token_logps
+            sequence_logps_diff = (per_token_diff * completion_mask).sum(dim=-1)  # [B]
+            # For metrics, we still need sequence_logps
+            with torch.no_grad():
+                sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)
+                anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
         elif self.anchor_policy is not None:
             # Use dedicated anchor policy (fixed/ema/kl_triggered modes)
             with torch.no_grad():
@@ -2001,6 +2006,11 @@ class ADPOTrainer(BaseTrainer):
                     token_type_ids=inputs.get("token_type_ids"),
                 )
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
+            # Compute diff for loss - anchor is already detached (from no_grad)
+            per_token_diff = per_token_logps - anchor_per_token_logps
+            sequence_logps_diff = (per_token_diff * completion_mask).sum(dim=-1)
+            with torch.no_grad():
+                sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)
         elif self.ref_model is not None:
             # Fallback to ref_model if no anchor (e.g., PEFT mode)
             with torch.no_grad():
@@ -2018,6 +2028,10 @@ class ADPOTrainer(BaseTrainer):
                     token_type_ids=inputs.get("token_type_ids"),
                 )
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
+            per_token_diff = per_token_logps - anchor_per_token_logps
+            sequence_logps_diff = (per_token_diff * completion_mask).sum(dim=-1)
+            with torch.no_grad():
+                sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)
         else:
             # No anchor available, disable adapter for PEFT
             with self.accelerator.unwrap_model(self.model).disable_adapter():
@@ -2035,6 +2049,10 @@ class ADPOTrainer(BaseTrainer):
                     token_type_ids=inputs.get("token_type_ids"),
                 )
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
+            per_token_diff = per_token_logps - anchor_per_token_logps
+            sequence_logps_diff = (per_token_diff * completion_mask).sum(dim=-1)
+            with torch.no_grad():
+                sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)
 
         # Adaptive Temperature Scaling (Section 3.7)
         # Check if batch size is compatible with num_generations
@@ -2055,28 +2073,30 @@ class ADPOTrainer(BaseTrainer):
             advantages_norm = advantages - advantages.mean(dim=1, keepdim=True)
             
             # Calculate q = softmax(R_norm / beta_reward)
+            # q_target is the target distribution, not part of the gradient computation
             q_logits = advantages_norm / self.args.beta_reward
-            q_target = torch.nn.functional.softmax(q_logits, dim=-1)
+            q_target = torch.nn.functional.softmax(q_logits, dim=-1).detach()
         else:
             # Fallback for incompatible batch sizes (should be rare if config is correct)
             q_target = None 
 
         if self.args.use_adaptive_tau and batch_size % self.num_generations == 0:
-            # H(q)
-            entropy = -(q_target * torch.log(q_target + 1e-8)).sum(dim=-1)
-            max_entropy = torch.log(torch.tensor(self.num_generations, dtype=q_target.dtype, device=q_target.device))
-            
-            # tau(x) = max(tau_min, tau_base * (1 - alpha * (1 - H/H_max)))
-            # Logic: 
-            # - High Entropy (uncertain rewards) -> H/H_max ~ 1 -> factor ~ 1 -> tau keeps high (base)
-            # - Low Entropy (certain rewards)    -> H/H_max ~ 0 -> factor ~ 1-alpha -> tau drops
-            normalized_entropy = entropy / max_entropy
-            adaptive_factor = 1.0 - self.args.adaptive_tau_alpha * (1.0 - normalized_entropy)
-            current_tau = self.args.tau * adaptive_factor
-            current_tau = torch.clamp(current_tau, min=self.args.adaptive_tau_min)
-            
-            # Broadcast: [B_prompts] -> [B_prompts, K] -> [B_total]
-            current_tau = current_tau.unsqueeze(-1).repeat(1, self.num_generations).view(-1)
+            # H(q) - computed from detached q_target, but detach again for safety
+            with torch.no_grad():
+                entropy = -(q_target * torch.log(q_target + 1e-8)).sum(dim=-1)
+                max_entropy = torch.log(torch.tensor(self.num_generations, dtype=q_target.dtype, device=q_target.device))
+                
+                # tau(x) = max(tau_min, tau_base * (1 - alpha * (1 - H/H_max)))
+                # Logic: 
+                # - High Entropy (uncertain rewards) -> H/H_max ~ 1 -> factor ~ 1 -> tau keeps high (base)
+                # - Low Entropy (certain rewards)    -> H/H_max ~ 0 -> factor ~ 1-alpha -> tau drops
+                normalized_entropy = entropy / max_entropy
+                adaptive_factor = 1.0 - self.args.adaptive_tau_alpha * (1.0 - normalized_entropy)
+                current_tau = self.args.tau * adaptive_factor
+                current_tau = torch.clamp(current_tau, min=self.args.adaptive_tau_min)
+                
+                # Broadcast: [B_prompts] -> [B_prompts, K] -> [B_total]
+                current_tau = current_tau.unsqueeze(-1).repeat(1, self.num_generations).view(-1)
             
             # Log mean tau for diagnostics
             if self.state.global_step % 10 == 0:
@@ -2096,7 +2116,8 @@ class ADPOTrainer(BaseTrainer):
             current_tau = self.args.tau
 
         # Compute anchored scores: (s - s_anchor) / tau
-        anchored_scores = (sequence_logps - anchor_sequence_logps) / current_tau
+        # Use pre-computed sequence_logps_diff for memory efficiency
+        anchored_scores = sequence_logps_diff / current_tau
 
         # Reshape to [B_prompts, num_generations]
         B_total = anchored_scores.size(0)
@@ -2108,14 +2129,18 @@ class ADPOTrainer(BaseTrainer):
              advantages = inputs["advantages"].view(B_prompts, self.num_generations)
              if self.args.use_q_centering:
                 advantages = advantages - advantages.mean(dim=1, keepdim=True)
-             q_target = torch.nn.functional.softmax(advantages / self.args.beta_reward, dim=-1)
+             q_target = torch.nn.functional.softmax(advantages / self.args.beta_reward, dim=-1).detach()
 
         # Implement ADPO Eq (2): q-centering of anchored logits
         # bar{u}_i = u_i - sum_j q(j) u_j
         # This projects logits onto the tangent space 1_perp (U-PXU projection)
-        if self.args.use_q_centering:
-            expected_u = (q_target * anchored_scores).sum(dim=1, keepdim=True)
-            anchored_scores = anchored_scores - expected_u
+        # OPTIMIZATION: Commented out because Softmax is translation invariant. 
+        # Doing this explicitly wastes memory (OOM risk) and has NO effect on gradients.
+        # if self.args.use_q_centering:
+        #    # expected_u must be detached to avoid creating a complex computation graph
+        #    # that retains intermediate activations and causes OOM
+        #    expected_u = (q_target * anchored_scores).sum(dim=1, keepdim=True).detach()
+        #    anchored_scores = anchored_scores - expected_u
 
         # ADPO listwise loss: cross-entropy
         log_p_anchored = torch.nn.functional.log_softmax(anchored_scores, dim=-1)
