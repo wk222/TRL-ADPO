@@ -1975,20 +1975,23 @@ class ADPOTrainer(BaseTrainer):
         )
 
         # Compute anchor policy scores based on mode
-        # Optimization: compute (logps - anchor_logps) at token level first, then sum
-        # This avoids keeping two separate sequence_logps tensors in memory
+        # REVERTED "Optimization": Calculating diff at token level creates a HUGE [B, L] tensor 
+        # that causes OOM. Calculating sum first reduces it to [B] which is tiny.
         if self.args.anchor_update_mode == "on_policy":
             # On-policy mode: use old_per_token_logps (like GRPO)
             # This makes anchor = policy at generation time, updated every generation
             old_per_token_logps = inputs.get("old_per_token_logps")
             anchor_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
-            # Compute diff at token level, then sum - more memory efficient
-            per_token_diff = per_token_logps - anchor_per_token_logps
-            sequence_logps_diff = (per_token_diff * completion_mask).sum(dim=-1)  # [B]
-            # For metrics, we still need sequence_logps
+            
+            # Compute sequence logits first (Shape: [B]) to save memory
+            # Do NOT compute per_token_diff (Shape: [B, L])!
             with torch.no_grad():
-                sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
+                sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)
+            
+            # Compute diff at sequence level
+            sequence_logps_diff = sequence_logps - anchor_sequence_logps
+            
         elif self.anchor_policy is not None:
             # Use dedicated anchor policy (fixed/ema/kl_triggered modes)
             with torch.no_grad():
@@ -2006,11 +2009,11 @@ class ADPOTrainer(BaseTrainer):
                     token_type_ids=inputs.get("token_type_ids"),
                 )
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
-            # Compute diff for loss - anchor is already detached (from no_grad)
-            per_token_diff = per_token_logps - anchor_per_token_logps
-            sequence_logps_diff = (per_token_diff * completion_mask).sum(dim=-1)
+            
+            # Compute diff at sequence level
             with torch.no_grad():
                 sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)
+            sequence_logps_diff = sequence_logps - anchor_sequence_logps
         elif self.ref_model is not None:
             # Fallback to ref_model if no anchor (e.g., PEFT mode)
             with torch.no_grad():
@@ -2028,10 +2031,11 @@ class ADPOTrainer(BaseTrainer):
                     token_type_ids=inputs.get("token_type_ids"),
                 )
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
-            per_token_diff = per_token_logps - anchor_per_token_logps
-            sequence_logps_diff = (per_token_diff * completion_mask).sum(dim=-1)
+            
+            # Compute diff at sequence level
             with torch.no_grad():
                 sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)
+            sequence_logps_diff = sequence_logps - anchor_sequence_logps
         else:
             # No anchor available, disable adapter for PEFT
             with self.accelerator.unwrap_model(self.model).disable_adapter():
@@ -2049,10 +2053,11 @@ class ADPOTrainer(BaseTrainer):
                     token_type_ids=inputs.get("token_type_ids"),
                 )
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
-            per_token_diff = per_token_logps - anchor_per_token_logps
-            sequence_logps_diff = (per_token_diff * completion_mask).sum(dim=-1)
+            
+            # Compute diff at sequence level
             with torch.no_grad():
                 sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)
+            sequence_logps_diff = sequence_logps - anchor_sequence_logps
 
         # Adaptive Temperature Scaling (Section 3.7)
         # Check if batch size is compatible with num_generations
