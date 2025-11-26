@@ -1975,25 +1975,32 @@ class ADPOTrainer(BaseTrainer):
         )
 
         # Compute anchor policy scores based on mode
-        # REVERTED "Optimization": Calculating diff at token level creates a HUGE [B, L] tensor 
-        # that causes OOM. Calculating sum first reduces it to [B] which is tiny.
+        # CRITICAL FIX: sequence_logps MUST be computed OUTSIDE no_grad() to maintain gradient flow!
+        # If computed inside no_grad(), PyTorch cannot track the dependency and keeps the huge
+        # per_token_logps [B, L] tensor in memory, causing OOM.
         if self.args.anchor_update_mode == "on_policy":
             # On-policy mode: use old_per_token_logps (like GRPO)
             # This makes anchor = policy at generation time, updated every generation
             old_per_token_logps = inputs.get("old_per_token_logps")
             anchor_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
             
-            # Compute sequence logits first (Shape: [B]) to save memory
-            # Do NOT compute per_token_diff (Shape: [B, L])!
+            # ✅ CORRECT: Compute sequence_logps in normal mode (with gradients)
+            sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)  # [B]
+            
+            # ✅ CORRECT: Only anchor needs no_grad
             with torch.no_grad():
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
-                sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)
             
             # Compute diff at sequence level
             sequence_logps_diff = sequence_logps - anchor_sequence_logps
             
         elif self.anchor_policy is not None:
             # Use dedicated anchor policy (fixed/ema/kl_triggered modes)
+            
+            # ✅ CORRECT: Compute sequence_logps in normal mode (with gradients)
+            sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)  # [B]
+            
+            # ✅ CORRECT: Only anchor computation needs no_grad
             with torch.no_grad():
                 anchor_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     self.anchor_policy,
@@ -2011,11 +2018,14 @@ class ADPOTrainer(BaseTrainer):
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
             
             # Compute diff at sequence level
-            with torch.no_grad():
-                sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)
             sequence_logps_diff = sequence_logps - anchor_sequence_logps
         elif self.ref_model is not None:
             # Fallback to ref_model if no anchor (e.g., PEFT mode)
+            
+            # ✅ CORRECT: Compute sequence_logps in normal mode (with gradients)
+            sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)  # [B]
+            
+            # ✅ CORRECT: Only anchor/ref computation needs no_grad
             with torch.no_grad():
                 anchor_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     self.ref_model,
@@ -2033,11 +2043,14 @@ class ADPOTrainer(BaseTrainer):
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
             
             # Compute diff at sequence level
-            with torch.no_grad():
-                sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)
             sequence_logps_diff = sequence_logps - anchor_sequence_logps
         else:
             # No anchor available, disable adapter for PEFT
+            
+            # ✅ CORRECT: Compute sequence_logps in normal mode (with gradients)
+            sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)  # [B]
+            
+            # ✅ CORRECT: Only anchor (disabled adapter) computation needs special context
             with self.accelerator.unwrap_model(self.model).disable_adapter():
                 anchor_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     model,
@@ -2052,11 +2065,11 @@ class ADPOTrainer(BaseTrainer):
                     image_sizes=inputs.get("image_sizes"),
                     token_type_ids=inputs.get("token_type_ids"),
                 )
+            
+            with torch.no_grad():
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
             
             # Compute diff at sequence level
-            with torch.no_grad():
-                sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)
             sequence_logps_diff = sequence_logps - anchor_sequence_logps
 
         # Adaptive Temperature Scaling (Section 3.7)
