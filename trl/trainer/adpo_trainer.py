@@ -1775,6 +1775,7 @@ class ADPOTrainer(BaseTrainer):
         )
         all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
         advantages = advantages[process_slice]
+        rewards_sliced = rewards[process_slice]  # keep rewards for drop_all_failed_prompts
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         for i, reward_func_name in enumerate(self.reward_func_names):
@@ -1834,7 +1835,7 @@ class ADPOTrainer(BaseTrainer):
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
             "advantages": advantages,
-            "rewards": rewards,
+            "rewards": rewards_sliced,
             "num_items_in_batch": num_items_in_batch,
         }
         if old_per_token_logps is not None:
