@@ -1974,33 +1974,18 @@ class ADPOTrainer(BaseTrainer):
             token_type_ids=inputs.get("token_type_ids"),
         )
 
+        # Sum to get sequence-level log probs (MUST be outside no_grad to maintain gradient flow!)
+        sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)  # [B]
+
         # Compute anchor policy scores based on mode
-        # CRITICAL FIX: sequence_logps MUST be computed OUTSIDE no_grad() to maintain gradient flow!
-        # If computed inside no_grad(), PyTorch cannot track the dependency and keeps the huge
-        # per_token_logps [B, L] tensor in memory, causing OOM.
         if self.args.anchor_update_mode == "on_policy":
             # On-policy mode: use old_per_token_logps (like GRPO)
             # This makes anchor = policy at generation time, updated every generation
             old_per_token_logps = inputs.get("old_per_token_logps")
             anchor_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
-            
-            # ✅ CORRECT: Compute sequence_logps in normal mode (with gradients)
-            sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)  # [B]
-            
-            # ✅ CORRECT: Only anchor needs no_grad
-            with torch.no_grad():
-                anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
-            
-            # Compute diff at sequence level
-            sequence_logps_diff = sequence_logps - anchor_sequence_logps
-            
+            anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
         elif self.anchor_policy is not None:
             # Use dedicated anchor policy (fixed/ema/kl_triggered modes)
-            
-            # ✅ CORRECT: Compute sequence_logps in normal mode (with gradients)
-            sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)  # [B]
-            
-            # ✅ CORRECT: Only anchor computation needs no_grad
             with torch.no_grad():
                 anchor_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     self.anchor_policy,
@@ -2016,16 +2001,8 @@ class ADPOTrainer(BaseTrainer):
                     token_type_ids=inputs.get("token_type_ids"),
                 )
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
-            
-            # Compute diff at sequence level
-            sequence_logps_diff = sequence_logps - anchor_sequence_logps
         elif self.ref_model is not None:
             # Fallback to ref_model if no anchor (e.g., PEFT mode)
-            
-            # ✅ CORRECT: Compute sequence_logps in normal mode (with gradients)
-            sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)  # [B]
-            
-            # ✅ CORRECT: Only anchor/ref computation needs no_grad
             with torch.no_grad():
                 anchor_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     self.ref_model,
@@ -2041,16 +2018,8 @@ class ADPOTrainer(BaseTrainer):
                     token_type_ids=inputs.get("token_type_ids"),
                 )
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
-            
-            # Compute diff at sequence level
-            sequence_logps_diff = sequence_logps - anchor_sequence_logps
         else:
             # No anchor available, disable adapter for PEFT
-            
-            # ✅ CORRECT: Compute sequence_logps in normal mode (with gradients)
-            sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)  # [B]
-            
-            # ✅ CORRECT: Only anchor (disabled adapter) computation needs special context
             with self.accelerator.unwrap_model(self.model).disable_adapter():
                 anchor_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     model,
@@ -2065,12 +2034,7 @@ class ADPOTrainer(BaseTrainer):
                     image_sizes=inputs.get("image_sizes"),
                     token_type_ids=inputs.get("token_type_ids"),
                 )
-            
-            with torch.no_grad():
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
-            
-            # Compute diff at sequence level
-            sequence_logps_diff = sequence_logps - anchor_sequence_logps
 
         # Adaptive Temperature Scaling (Section 3.7)
         # Check if batch size is compatible with num_generations
@@ -2134,8 +2098,8 @@ class ADPOTrainer(BaseTrainer):
             current_tau = self.args.tau
 
         # Compute anchored scores: (s - s_anchor) / tau
-        # Use pre-computed sequence_logps_diff for memory efficiency
-        anchored_scores = sequence_logps_diff / current_tau
+        # CRITICAL: Compute the diff HERE (not earlier) so per_token_logps can be freed from memory
+        anchored_scores = (sequence_logps - anchor_sequence_logps) / current_tau
 
         # Reshape to [B_prompts, num_generations]
         B_total = anchored_scores.size(0)
