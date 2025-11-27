@@ -2036,58 +2036,110 @@ class ADPOTrainer(BaseTrainer):
                 )
                 anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
 
-        # Adaptive Temperature Scaling (Section 3.7)
-        # Check if batch size is compatible with num_generations
-        batch_size = inputs["advantages"].size(0)
+        # ============================================================
+        # Smooth Hybrid Adaptive Temperature Scaling
+        # ============================================================
+        # Formula: τ = τ_base × (1 + α·H_norm + β·(1-H_norm)·(1-R_norm))
+        # 
+        # This strategy handles ALL corner cases:
+        # - Master (low H, high R):      τ ≈ τ_base (learn normally)
+        # - Confused Beginner (high H):  τ ↑ (trust anchor, avoid noise)
+        # - Arrogant Idiot (low H, low R): τ ↑↑↑ (strong pull to anchor!)
+        # - Lucky Guesser (high H, high R): τ ↑ (moderate caution)
+        # ============================================================
         
-        # Prepare q_target with explicit normalization as requested
+        batch_size = inputs["advantages"].size(0)
+        B_prompts = batch_size // self.num_generations
+        
         # Get advantages and reshape
         advantages = inputs["advantages"]  # [B_total]
-        B_prompts = batch_size // self.num_generations
         
         if batch_size % self.num_generations == 0:
             advantages = advantages.view(B_prompts, self.num_generations)
             
-            # Explicit Group-wise Normalization: R_norm = (R - mean) / (std + eps)
-            # This ensures q reflects relative quality regardless of reward scale
-            # FIXED: Removed division by std to avoid softmax saturation (gradient vanishing) when std is small.
-            # Using simple centering (U-PXU projection idea applied to advantages)
+            # Explicit Group-wise Normalization for q_target
             advantages_norm = advantages - advantages.mean(dim=1, keepdim=True)
             
             # Calculate q = softmax(R_norm / beta_reward)
-            # q_target is the target distribution, not part of the gradient computation
             q_logits = advantages_norm / self.args.beta_reward
             q_target = torch.nn.functional.softmax(q_logits, dim=-1).detach()
         else:
-            # Fallback for incompatible batch sizes (should be rare if config is correct)
             q_target = None 
 
         if self.args.use_adaptive_tau and batch_size % self.num_generations == 0:
-            # H(q) - computed from detached q_target, but detach again for safety
             with torch.no_grad():
-                entropy = -(q_target * torch.log(q_target + 1e-8)).sum(dim=-1)
-                max_entropy = torch.log(torch.tensor(self.num_generations, dtype=q_target.dtype, device=q_target.device))
+                # ========================================
+                # Step 1: Compute Normalized Entropy (H_norm)
+                # ========================================
+                # Use per-token entropy from model output (already computed above)
+                # Mean entropy per sample: [B_total] -> [B_prompts, K] -> mean over K -> [B_prompts]
+                mean_token_entropy = (entropies * completion_mask).sum(dim=-1) / completion_mask.sum(dim=-1).clamp(min=1.0)
+                mean_token_entropy = mean_token_entropy.view(B_prompts, self.num_generations).mean(dim=1)  # [B_prompts]
                 
-                # tau(x) = max(tau_min, tau_base * (1 - alpha * (1 - H/H_max)))
-                # Logic: 
-                # - High Entropy (uncertain rewards) -> H/H_max ~ 1 -> factor ~ 1 -> tau keeps high (base)
-                # - Low Entropy (certain rewards)    -> H/H_max ~ 0 -> factor ~ 1-alpha -> tau drops
-                normalized_entropy = entropy / max_entropy
-                adaptive_factor = 1.0 - self.args.adaptive_tau_alpha * (1.0 - normalized_entropy)
-                current_tau = self.args.tau * adaptive_factor
-                current_tau = torch.clamp(current_tau, min=self.args.adaptive_tau_min)
+                # Normalize by max possible entropy (log(vocab_size))
+                # Get vocab_size from model config
+                vocab_size = self.model.config.vocab_size
+                max_token_entropy = torch.log(torch.tensor(vocab_size, dtype=entropies.dtype, device=entropies.device))
+                
+                # H_norm: 0 = confident, 1 = confused (maximum uncertainty)
+                normalized_entropy = (mean_token_entropy / max_token_entropy).clamp(0, 1)  # [B_prompts]
+                
+                # ========================================
+                # Step 2: Compute Normalized Reward (R_norm)
+                # ========================================
+                # Get rewards and reshape to [B_prompts, K]
+                rewards = inputs["rewards"].view(B_prompts, self.num_generations)
+                
+                # Mean reward per prompt group
+                mean_rewards = rewards.mean(dim=1)  # [B_prompts]
+                
+                # Min-max normalization within batch (to handle different reward scales)
+                r_min, r_max = mean_rewards.min(), mean_rewards.max()
+                if r_max > r_min + 1e-6:
+                    normalized_reward = (mean_rewards - r_min) / (r_max - r_min)
+                else:
+                    # If all rewards are the same, treat as uncertain (0.5)
+                    normalized_reward = torch.full_like(mean_rewards, 0.5)
+                
+                # R_norm: 0 = all wrong, 1 = all correct
+                normalized_reward = normalized_reward.clamp(0, 1)  # [B_prompts]
+                
+                # ========================================
+                # Step 3: Smooth Hybrid Formula
+                # ========================================
+                # confidence = 1 - H_norm (high when model is certain)
+                # error = 1 - R_norm (high when rewards are low)
+                confidence = (1.0 - normalized_entropy).clamp(min=0)
+                error = (1.0 - normalized_reward).clamp(min=0)
+                
+                # Uncertainty term: protects against high entropy (confused model)
+                uncertainty_term = self.args.adaptive_tau_alpha * normalized_entropy
+                
+                # Penalty term: punishes confident but wrong predictions (arrogant idiot)
+                # This term is HIGH when: confidence HIGH AND error HIGH
+                penalty_term = self.args.adaptive_tau_beta * confidence * error
+                
+                # Final adaptive tau per prompt
+                current_tau = self.args.tau * (1.0 + uncertainty_term + penalty_term)
+                
+                # Clamp to safe range
+                current_tau = torch.clamp(current_tau, min=self.args.adaptive_tau_min, max=self.args.adaptive_tau_max)
                 
                 # Broadcast: [B_prompts] -> [B_prompts, K] -> [B_total]
                 current_tau = current_tau.unsqueeze(-1).repeat(1, self.num_generations).view(-1)
             
-            # Log mean tau for diagnostics
-            if self.state.global_step % 10 == 0:
-                 mode = "train" if self.model.training else "eval"
-                 self._metrics[mode]["adpo/mean_tau"] = [current_tau.mean().item()]
+            # Log diagnostics
+            mode = "train" if self.model.training else "eval"
+            self._metrics[mode]["adpo/tau_mean"].append(current_tau.mean().item())
+            self._metrics[mode]["adpo/tau_min"].append(current_tau.min().item())
+            self._metrics[mode]["adpo/tau_max"].append(current_tau.max().item())
+            self._metrics[mode]["adpo/entropy_norm_mean"].append(normalized_entropy.mean().item())
+            self._metrics[mode]["adpo/reward_norm_mean"].append(normalized_reward.mean().item())
+            self._metrics[mode]["adpo/penalty_term_mean"].append(penalty_term.mean().item())
+            
         else:
             # Use fixed tau if batch size doesn't match or adaptive_tau is disabled
             if self.args.use_adaptive_tau and batch_size % self.num_generations != 0:
-                # Only warn once
                 if not hasattr(self, '_adaptive_tau_warning_shown'):
                     logger.warning(
                         f"Adaptive tau is enabled but batch size ({batch_size}) is not divisible by "

@@ -136,15 +136,31 @@ class ADPOConfig(GRPOConfig):
     )
     use_adaptive_tau: bool = field(
         default=True,
-        metadata={"help": "Whether to use entropy-based adaptive temperature scaling (Section 3.7 of paper)."},
+        metadata={"help": "Whether to use Smooth Hybrid adaptive temperature scaling."},
     )
     adaptive_tau_alpha: float = field(
-        default=0.5,
-        metadata={"help": "Modulation strength for adaptive tau. Formula: tau * (1 - alpha * H/H_max)"},
+        default=1.0,
+        metadata={
+            "help": "Uncertainty protection coefficient for adaptive tau. "
+            "Controls how much high entropy increases tau. "
+            "Formula: tau * (1 + alpha * H_norm + beta * (1-H_norm) * (1-R_norm))"
+        },
+    )
+    adaptive_tau_beta: float = field(
+        default=5.0,
+        metadata={
+            "help": "Blind confidence penalty coefficient for adaptive tau. "
+            "Controls punishment for low entropy + low reward (arrogant idiot scenario). "
+            "Higher values = stronger pull back to anchor when model is confidently wrong."
+        },
     )
     adaptive_tau_min: float = field(
-        default=0.05,
-        metadata={"help": "Minimum value for tau when using adaptive scaling (to prevent division by zero)."},
+        default=0.1,
+        metadata={"help": "Minimum value for tau when using adaptive scaling (to prevent instability)."},
+    )
+    adaptive_tau_max: float = field(
+        default=10.0,
+        metadata={"help": "Maximum value for tau when using adaptive scaling (to prevent gradient vanishing)."},
     )
     beta_reward: float = field(
         default=0.5,
