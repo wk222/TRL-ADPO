@@ -718,81 +718,9 @@ class ADPOTrainer(BaseTrainer):
                         reward_func, evaluation_mode=True, device_placement=True
                     )
         
-        # ADPO-specific: Anchor policy initialization
-        logger.info(f"[ADPO] Initializing anchor policy with mode: {args.anchor_update_mode}")
-        self.anchor_policy = self._create_anchor_policy(model, model_id, model_init_kwargs, is_peft_model(model))
-        
-        # Prepare anchor policy for distributed training
-        if self.anchor_policy is not None:
-            if self.is_deepspeed_enabled:
-                self.anchor_policy = prepare_deepspeed(self.anchor_policy, self.accelerator)
-            elif self.is_fsdp_enabled:
-                self.anchor_policy = prepare_fsdp(self.anchor_policy, self.accelerator)
-            else:
-                self.anchor_policy = self.accelerator.prepare_model(self.anchor_policy, evaluation_mode=True)
-        
-        # ADPO tracking
-        self.kl_window = []
-        self.kl_window_size = 10
-        self.anchor_update_count = 0
-
-    def _create_anchor_policy(self, model, model_id, model_init_kwargs, is_peft):
-        """Create and initialize anchor policy for ADPO"""
-        if self.args.anchor_update_mode == "on_policy":
-            # On-policy mode: no need for separate anchor, use old_per_token_logps
-            logger.info("[ADPO] On-policy mode: using old_per_token_logps as anchor (like GRPO)")
-            return None
-        elif is_peft:
-            # For PEFT models, anchor can use the base model
-            return None
-        else:
-            # Create a fresh copy of the model as anchor
-            config = AutoConfig.from_pretrained(model_id)
-            architecture = getattr(transformers, config.architectures[0])
-            anchor = architecture.from_pretrained(model_id, **model_init_kwargs)
-            
-            # Freeze anchor
-            anchor.eval()
-            for param in anchor.parameters():
-                param.requires_grad = False
-            
-            return anchor
-    
-    def _update_anchor_policy(self):
-        """Update anchor policy based on args.anchor_update_mode"""
-        if self.anchor_policy is None or self.args.anchor_update_mode in ["fixed", "on_policy"]:
-            return  # No update for PEFT, fixed, or on_policy mode (on_policy uses old_per_token_logps)
-        
-        if self.args.anchor_update_mode == "ema":
-            # EMA update: anchor = alpha * anchor + (1-alpha) * current
-            alpha = self.args.ema_alpha
-            with torch.no_grad():
-                # Unwrap model to handle FSDP/DeepSpeed sharded states (especially ZeRO3)
-                unwrapped_model = self.accelerator.unwrap_model(self.model)
-                unwrapped_anchor = self.accelerator.unwrap_model(self.anchor_policy)
-                for anchor_param, current_param in zip(
-                    unwrapped_anchor.parameters(),
-                    unwrapped_model.parameters()
-                ):
-                    anchor_param.data.mul_(alpha).add_((1 - alpha) * current_param.data)
-            self.anchor_update_count += 1
-        
-        elif self.args.anchor_update_mode == "kl_triggered":
-            # Update when mean KL exceeds threshold
-            if len(self.kl_window) >= self.kl_window_size:
-                mean_kl = torch.tensor(self.kl_window).mean().item()
-                if mean_kl > self.args.kl_threshold:
-                    # Hard copy - unwrap models to handle FSDP/DeepSpeed sharded states
-                    with torch.no_grad():
-                        unwrapped_model = self.accelerator.unwrap_model(self.model)
-                        unwrapped_anchor = self.accelerator.unwrap_model(self.anchor_policy)
-                        for anchor_param, current_param in zip(
-                            unwrapped_anchor.parameters(),
-                            unwrapped_model.parameters()
-                        ):
-                            anchor_param.data.copy_(current_param.data)
-                    self.anchor_update_count += 1
-                    self.kl_window = []  # Reset window after update
+        # ADPO: on-policy mode only, no separate anchor model needed
+        logger.info("[ADPO] Using on-policy anchor (old_per_token_logps from generation time)")
+        self.anchor_policy = None  # No separate anchor model
     
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -1916,46 +1844,38 @@ class ADPOTrainer(BaseTrainer):
 
     def _compute_loss(self, model, inputs):
         """
-        ADPO Loss: Anchored listwise cross-entropy
+        ADPO Loss: Anchored listwise cross-entropy (on-policy mode only)
         
-        Unlike GRPO's PPO-style clipping, ADPO uses:
-        L = -E[q_target * log(p_anchored)]
+        Loss: L = -E[q_target * log(p_anchored)]
         where p_anchored(i|S) = softmax((s_i - s_anchor_i) / tau)
+        
+        In on-policy mode, s_anchor comes from old_per_token_logps (stored during generation).
         """
         # Auto-truncate batch if not divisible by num_generations
         batch_size = inputs["advantages"].size(0)
         if batch_size % self.num_generations != 0:
-            # Calculate the largest valid batch size
             valid_batch_size = (batch_size // self.num_generations) * self.num_generations
 
             if valid_batch_size == 0:
-                # Batch too small, skip entirely
                 logger.warning(
                     f"Skipping batch: size {batch_size} < num_generations {self.num_generations}. "
                     f"Returning zero loss. Consider setting dataloader_drop_last=True in config."
                 )
                 return torch.tensor(0.0, device=inputs["advantages"].device, requires_grad=True)
 
-            # Truncate all inputs to valid_batch_size
             logger.warning(
                 f"Auto-truncating batch from {batch_size} to {valid_batch_size} samples "
                 f"(must be divisible by num_generations={self.num_generations}). "
-                f"Discarding {batch_size - valid_batch_size} samples. "
-                f"To avoid this, ensure per_device_*_batch_size is a multiple of num_generations, "
-                f"or set dataloader_drop_last=True."
             )
-
-            # Truncate all tensor inputs
             for key in inputs.keys():
                 if isinstance(inputs[key], torch.Tensor):
                     inputs[key] = inputs[key][:valid_batch_size]
-
             batch_size = valid_batch_size
 
         rewards_tensor = inputs.get("rewards")
-        rewards_on_device = None
+        rewards_on_device = None  # Lazy loading for memory efficiency
 
-        # Compute the per-token log probabilities for the model
+        # Get input tensors
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
@@ -1977,67 +1897,13 @@ class ADPOTrainer(BaseTrainer):
             token_type_ids=inputs.get("token_type_ids"),
         )
 
-        # Sum to get sequence-level log probs (MUST be outside no_grad to maintain gradient flow!)
+        # Compute sequence-level log probs
         sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)  # [B]
 
-        # Compute anchor policy scores based on mode
-        if self.args.anchor_update_mode == "on_policy":
-            # On-policy mode: use old_per_token_logps (like GRPO)
-            # This makes anchor = policy at generation time, updated every generation
-            old_per_token_logps = inputs.get("old_per_token_logps")
-            anchor_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
-            anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
-        elif self.anchor_policy is not None:
-            # Use dedicated anchor policy (fixed/ema/kl_triggered modes)
-            with torch.no_grad():
-                anchor_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.anchor_policy,
-                    input_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    compute_entropy=False,
-                    pixel_values=inputs.get("pixel_values"),
-                    image_grid_thw=inputs.get("image_grid_thw"),
-                    num_images=inputs.get("num_images"),
-                    pixel_attention_mask=inputs.get("pixel_attention_mask"),
-                    image_sizes=inputs.get("image_sizes"),
-                    token_type_ids=inputs.get("token_type_ids"),
-                )
-                anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
-        elif self.ref_model is not None:
-            # Fallback to ref_model if no anchor (e.g., PEFT mode)
-            with torch.no_grad():
-                anchor_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.ref_model,
-                    input_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    compute_entropy=False,
-                    pixel_values=inputs.get("pixel_values"),
-                    image_grid_thw=inputs.get("image_grid_thw"),
-                    num_images=inputs.get("num_images"),
-                    pixel_attention_mask=inputs.get("pixel_attention_mask"),
-                    image_sizes=inputs.get("image_sizes"),
-                    token_type_ids=inputs.get("token_type_ids"),
-                )
-                anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
-        else:
-            # No anchor available, disable adapter for PEFT
-            with self.accelerator.unwrap_model(self.model).disable_adapter():
-                anchor_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    model,
-                    input_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    compute_entropy=False,
-                    pixel_values=inputs.get("pixel_values"),
-                    image_grid_thw=inputs.get("image_grid_thw"),
-                    num_images=inputs.get("num_images"),
-                    pixel_attention_mask=inputs.get("pixel_attention_mask"),
-                    image_sizes=inputs.get("image_sizes"),
-                    token_type_ids=inputs.get("token_type_ids"),
-                )
-                anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
+        # On-policy anchor: use old_per_token_logps from generation time
+        old_per_token_logps = inputs.get("old_per_token_logps")
+        anchor_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
+        anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
 
         # ============================================================
         # Smooth Hybrid Adaptive Temperature Scaling
@@ -2245,20 +2111,13 @@ class ADPOTrainer(BaseTrainer):
         # Normalize by gradient accumulation steps
         loss = loss / self.current_gradient_accumulation_steps
 
-        # Track KL for adaptive anchor updates
+        # Track KL for logging
         with torch.no_grad():
             kl_val = (sequence_logps - anchor_sequence_logps).abs().mean().item()
-            self.kl_window.append(kl_val)
-            if len(self.kl_window) > self.kl_window_size:
-                self.kl_window.pop(0)
-
-        # Update anchor policy after computing loss
-        self._update_anchor_policy()
 
         # Log metrics
         mode = "train" if self.model.training else "eval"
         self._metrics[mode]["adpo/anchor_kl"].append(kl_val)
-        self._metrics[mode]["adpo/anchor_updates"] = [self.anchor_update_count]
         
         # Compute masked mean entropy (only over valid completion tokens, excluding padding)
         completion_token_count = completion_mask.sum().clamp(min=1.0)

@@ -143,3 +143,5 @@ checklink/cookies.txt
 nbs/wandb/
 examples/notebooks/wandb/
 wandb/
+full_diff_now.txt
+current_diff.txt
