@@ -1201,7 +1201,7 @@ class ADPOTrainer(BaseTrainer):
         if self.use_vllm:
             if self.vllm_mode == "colocate" and self.args.vllm_enable_sleep_mode:
                 # wake up colocated vLLM instances if needed
-                torch.cuda.empty_cache()  # required to avoid OOM in some cases
+                #torch.cuda.empty_cache()  # required to avoid OOM in some cases
                 self.llm.wake_up(tags=["weights"])
 
             # First, update the vLLM weights if needed
@@ -1882,13 +1882,16 @@ class ADPOTrainer(BaseTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)
 
+        # Memory optimization: only compute entropy if adaptive_tau is enabled
+        compute_entropy = self.args.use_adaptive_tau
+
         # Compute current model per-token log probs
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
             attention_mask,
             logits_to_keep,
-            compute_entropy=True,
+            compute_entropy=compute_entropy,
             pixel_values=inputs.get("pixel_values"),
             image_grid_thw=inputs.get("image_grid_thw"),
             num_images=inputs.get("num_images"),
@@ -1897,13 +1900,28 @@ class ADPOTrainer(BaseTrainer):
             token_type_ids=inputs.get("token_type_ids"),
         )
 
-        # Compute sequence-level log probs
+        # Compute sequence-level log probs (ADPO uses sequence-level like GRPO's sequence mode)
         sequence_logps = (per_token_logps * completion_mask).sum(dim=-1)  # [B]
 
         # On-policy anchor: use old_per_token_logps from generation time
         old_per_token_logps = inputs.get("old_per_token_logps")
         anchor_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
         anchor_sequence_logps = (anchor_per_token_logps * completion_mask).sum(dim=-1)
+        
+        # Memory optimization: compute mean entropy early if needed, then release per-token tensors
+        mean_entropy_per_sample = None
+        if compute_entropy and entropies is not None:
+            # Pre-compute mean entropy per sample before releasing entropies tensor
+            mean_entropy_per_sample = (entropies * completion_mask).sum(dim=-1) / completion_mask.sum(dim=-1).clamp(min=1.0)
+            del entropies  # Release [B, T] tensor early
+        
+        # Memory optimization: we only need per_token_logps for KL penalty later
+        # Store reference if needed, otherwise release
+        if self.args.beta_anchor_kl > 0:
+            _per_token_logps_for_kl = per_token_logps
+            _anchor_per_token_logps_for_kl = anchor_per_token_logps
+        else:
+            del per_token_logps, anchor_per_token_logps
 
         # ============================================================
         # Smooth Hybrid Adaptive Temperature Scaling
@@ -1940,15 +1958,12 @@ class ADPOTrainer(BaseTrainer):
                 # ========================================
                 # Step 1: Compute Normalized Entropy (H_norm)
                 # ========================================
-                # Use per-token entropy from model output (already computed above)
-                # Mean entropy per sample: [B_total] -> [B_prompts, K] -> mean over K -> [B_prompts]
-                mean_token_entropy = (entropies * completion_mask).sum(dim=-1) / completion_mask.sum(dim=-1).clamp(min=1.0)
-                mean_token_entropy = mean_token_entropy.view(B_prompts, self.num_generations).mean(dim=1)  # [B_prompts]
+                # Use pre-computed mean entropy (already aggregated to [B] earlier for memory efficiency)
+                mean_token_entropy = mean_entropy_per_sample.view(B_prompts, self.num_generations).mean(dim=1)  # [B_prompts]
                 
                 # Normalize by max possible entropy (log(vocab_size))
-                # Get vocab_size from model config
                 vocab_size = self.model.config.vocab_size
-                max_token_entropy = torch.log(torch.tensor(vocab_size, dtype=entropies.dtype, device=entropies.device))
+                max_token_entropy = torch.log(torch.tensor(vocab_size, dtype=mean_token_entropy.dtype, device=mean_token_entropy.device))
                 
                 # H_norm: 0 = confident, 1 = confused (maximum uncertainty)
                 normalized_entropy = (mean_token_entropy / max_token_entropy).clamp(0, 1)  # [B_prompts]
@@ -2094,8 +2109,8 @@ class ADPOTrainer(BaseTrainer):
         # Optional: Add KL penalty (like GRPO's beta)
         if self.args.beta_anchor_kl > 0:
             per_token_kl = (
-                torch.exp(anchor_per_token_logps - per_token_logps) -
-                (anchor_per_token_logps - per_token_logps) - 1
+                torch.exp(_anchor_per_token_logps_for_kl - _per_token_logps_for_kl) -
+                (_anchor_per_token_logps_for_kl - _per_token_logps_for_kl) - 1
             )
             
             # Mask KL for dropped prompts
@@ -2119,12 +2134,12 @@ class ADPOTrainer(BaseTrainer):
         mode = "train" if self.model.training else "eval"
         self._metrics[mode]["adpo/anchor_kl"].append(kl_val)
         
-        # Compute masked mean entropy (only over valid completion tokens, excluding padding)
-        completion_token_count = completion_mask.sum().clamp(min=1.0)
-        mean_entropy = (entropies * completion_mask).sum() / completion_token_count
-        self._metrics[mode]["entropy"].append(
-            self.accelerator.gather(mean_entropy).nanmean().item()
-        )
+        # Log mean entropy (use pre-computed value if available)
+        if mean_entropy_per_sample is not None:
+            mean_entropy = mean_entropy_per_sample.mean()
+            self._metrics[mode]["entropy"].append(
+                self.accelerator.gather(mean_entropy).nanmean().item()
+            )
 
         if self.args.beta_anchor_kl > 0:
             self._metrics[mode]["adpo/kl_penalty"].append(
