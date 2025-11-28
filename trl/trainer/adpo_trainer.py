@@ -1775,7 +1775,7 @@ class ADPOTrainer(BaseTrainer):
         )
         all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
         advantages = advantages[process_slice]
-        rewards_sliced = rewards[process_slice]  # keep rewards for drop_all_failed_prompts
+        rewards_sliced = rewards[process_slice].detach().to("cpu")  # keep rewards off GPU unless needed later
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         for i, reward_func_name in enumerate(self.reward_func_names):
@@ -1927,7 +1927,7 @@ class ADPOTrainer(BaseTrainer):
         if batch_size % self.num_generations != 0:
             # Calculate the largest valid batch size
             valid_batch_size = (batch_size // self.num_generations) * self.num_generations
-            
+
             if valid_batch_size == 0:
                 # Batch too small, skip entirely
                 logger.warning(
@@ -1935,7 +1935,7 @@ class ADPOTrainer(BaseTrainer):
                     f"Returning zero loss. Consider setting dataloader_drop_last=True in config."
                 )
                 return torch.tensor(0.0, device=inputs["advantages"].device, requires_grad=True)
-            
+
             # Truncate all inputs to valid_batch_size
             logger.warning(
                 f"Auto-truncating batch from {batch_size} to {valid_batch_size} samples "
@@ -1944,14 +1944,17 @@ class ADPOTrainer(BaseTrainer):
                 f"To avoid this, ensure per_device_*_batch_size is a multiple of num_generations, "
                 f"or set dataloader_drop_last=True."
             )
-            
+
             # Truncate all tensor inputs
             for key in inputs.keys():
                 if isinstance(inputs[key], torch.Tensor):
                     inputs[key] = inputs[key][:valid_batch_size]
-            
+
             batch_size = valid_batch_size
-        
+
+        rewards_tensor = inputs.get("rewards")
+        rewards_on_device = None
+
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -2087,8 +2090,16 @@ class ADPOTrainer(BaseTrainer):
                 # ========================================
                 # Step 2: Compute Normalized Reward (R_norm)
                 # ========================================
-                # Get rewards and reshape to [B_prompts, K]
-                rewards = inputs["rewards"].view(B_prompts, self.num_generations)
+                # Get rewards and reshape to [B_prompts, K]. Move to device lazily to avoid holding them on GPU.
+                if rewards_tensor is None:
+                    raise ValueError("Adaptive tau requires rewards, but none were provided in inputs.")
+                if rewards_on_device is None:
+                    rewards_on_device = (
+                        rewards_tensor
+                        if rewards_tensor.device == sequence_logps.device
+                        else rewards_tensor.to(sequence_logps.device, non_blocking=True)
+                    )
+                rewards = rewards_on_device.view(B_prompts, self.num_generations)
                 
                 # Mean reward per prompt group
                 mean_rewards = rewards.mean(dim=1)  # [B_prompts]
@@ -2183,22 +2194,34 @@ class ADPOTrainer(BaseTrainer):
         # Drop failed prompts if requested
         valid_mask = None
         if self.args.drop_all_failed_prompts:
-            rewards = inputs["rewards"].view(B_prompts, self.num_generations)
-            # Check if all generations in the group have reward <= 0 (covers 0 and negative rewards)
-            is_failed = (rewards <= 0.0).all(dim=1)
-            if is_failed.any():
-                valid_mask = ~is_failed
-                if valid_mask.sum() == 0:
-                    loss = torch.tensor(0.0, device=per_prompt_loss.device, requires_grad=True)
-                else:
-                    loss = per_prompt_loss[valid_mask].mean()
-                
-                # Log dropped count
-                if self.state.global_step % 10 == 0:
-                    mode = "train" if self.model.training else "eval"
-                    self._metrics[mode]["adpo/dropped_prompts"] = [is_failed.sum().item()]
-            else:
+            if rewards_tensor is None:
+                logger.warning(
+                    "drop_all_failed_prompts=True but no rewards were provided. Skipping failed prompt dropping."
+                )
                 loss = per_prompt_loss.mean()
+            else:
+                if rewards_on_device is None:
+                    rewards_on_device = (
+                        rewards_tensor
+                        if rewards_tensor.device == per_prompt_loss.device
+                        else rewards_tensor.to(per_prompt_loss.device, non_blocking=True)
+                    )
+                rewards_for_drop = rewards_on_device.view(B_prompts, self.num_generations)
+                # Check if all generations in the group have reward <= 0 (covers 0 and negative rewards)
+                is_failed = (rewards_for_drop <= 0.0).all(dim=1)
+                if is_failed.any():
+                    valid_mask = ~is_failed
+                    if valid_mask.sum() == 0:
+                        loss = torch.tensor(0.0, device=per_prompt_loss.device, requires_grad=True)
+                    else:
+                        loss = per_prompt_loss[valid_mask].mean()
+
+                    # Log dropped count
+                    if self.state.global_step % 10 == 0:
+                        mode = "train" if self.model.training else "eval"
+                        self._metrics[mode]["adpo/dropped_prompts"] = [is_failed.sum().item()]
+                else:
+                    loss = per_prompt_loss.mean()
         else:
             loss = per_prompt_loss.mean()
 
